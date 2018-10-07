@@ -4,7 +4,7 @@ OFLAGS=-O0
 DEFINES=
 CXXFLAGS=-std=c++14 -g -I. -Wall -Wextra $(DEFINES) $(OFLAGS)
 
-LIBS=-lboost_program_options -lboost_system -lbluetooth -lble++
+LIBS=-lboost_program_options -lboost_system -lbluetooth -lble++ -lcryptopp -lssl -lcrypto -lcpprest
 LDFLAGS=$(LIBS)
 
 inc=$(OBJ:%.o=%.d)
