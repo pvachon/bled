@@ -312,6 +312,7 @@ void connect_nokelock(std::string const& token, std::string const& lock_mac)
 
     // Connect to the device
     gatt.connect_blocking(lock_mac);
+
     std::cout << "DEBUG: connected to device " << lock_mac << std::endl;
 
     while (false == done && false == terminate) {
@@ -396,9 +397,12 @@ void connect_nokelock(std::string const& token, std::string const& lock_mac)
         case STATE_SEARCHING:
             continue;
 
-        default:
-            std::cout << "Unexpected state, aborting the loop" << std::endl;
+        case STATE_DONE:
             done = true;
+            break;
+
+        default:
+            throw std::runtime_error("Unexpected state in unlock state machine, aborting.");
         }
     }
 
@@ -426,7 +430,7 @@ std::vector<std::string> find_nokelocks(std::size_t nr_iters = 10)
     BLEPP::HCIScanner scanner(true, BLEPP::HCIScanner::FilterDuplicates::Software,
             BLEPP::HCIScanner::ScanType::Active);
 
-    while (false == terminate and iter_id++ < nr_iters) {
+    while (locks.size() == 0 and false == terminate and iter_id++ < nr_iters) {
         FD_SET(scanner.get_fd(), &fd_scan);
 
         // This is shiesty
@@ -500,7 +504,14 @@ int main(int const argc, char const* const argv[])
         while (false == terminate) {
             auto locks = find_nokelocks();
             for (auto const& lock: locks) {
-                connect_nokelock(token, lock);
+                // Connect to the lock, but eat any exceptions that happen, since the
+                // lock could go out of range or just stop responding for various legitimate
+                // reasons.
+                try {
+                    connect_nokelock(token, lock);
+                } catch (...) {
+                    std::cout << "An error occurred while connecting to the lock." << std::endl;
+                }
             }
         }
     } else if (not mac_address.empty()) {
