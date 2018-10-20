@@ -195,10 +195,10 @@ nokelock::nokelock::ptr get_nokelock_keys(std::string const& token, std::string 
 
 enum lock_state {
     STATE_SEARCHING,
-    STATE_ATTACH_NOTIFY,
-    STATE_HANDSHAKE_1,
-    STATE_HANDSHAKE_2,
-    STATE_HANDSHAKE_3,
+    STATE_GET_TOKEN,
+    STATE_WAIT_GET_TOKEN,
+    STATE_GET_BATTERY,
+    STATE_WAIT_GET_BATTERY,
     STATE_SEND_UNLOCK_CMD,
     STATE_WAIT_UNLOCK_NOTIFY,
     STATE_WAIT_UNLOCK_FINISH,
@@ -238,14 +238,14 @@ void connect_nokelock(std::string const& token, std::string const& lock_mac)
         std::cout << std::dec << std::endl;
 
         switch (state) {
-        case STATE_HANDSHAKE_1:
+        case STATE_WAIT_GET_TOKEN:
             entropy[0] = plaintext[3];
             entropy[1] = plaintext[4];
             entropy[2] = plaintext[5];
             entropy[3] = plaintext[6];
-            state = STATE_HANDSHAKE_2;
+            state = STATE_GET_BATTERY;
             break;
-        case STATE_HANDSHAKE_3:
+        case STATE_WAIT_GET_BATTERY:
             state = STATE_SEND_UNLOCK_CMD;
             break;
         case STATE_WAIT_UNLOCK_NOTIFY:
@@ -284,7 +284,7 @@ void connect_nokelock(std::string const& token, std::string const& lock_mac)
                 }
             }
 
-            state = STATE_ATTACH_NOTIFY;
+            state = STATE_GET_TOKEN;
 
             // Now find the command endpoint (just make sure it's there)
             for (auto& characteristic: service.characteristics) {
@@ -324,13 +324,13 @@ void connect_nokelock(std::string const& token, std::string const& lock_mac)
         }
 
         switch (state) {
-        case STATE_ATTACH_NOTIFY:
+        case STATE_GET_TOKEN:
             // Send initial command
-            std::cout << "DEBUG: sending initial command" << std::endl;
+            std::cout << "DEBUG: sending GET_TOKEN command" << std::endl;
             for (auto& service: gatt.primary_services) {
                 for (auto& characteristic: service.characteristics) {
                     if (characteristic.uuid == command) {
-                        // Write the connect command out
+                        // Write the GET_TOKEN command out
                         std::array<std::uint8_t, 16> cmd = { 0x06, 0x01, 0x01, 0x01 };
 
                         for (auto v: cmd) {
@@ -341,18 +341,18 @@ void connect_nokelock(std::string const& token, std::string const& lock_mac)
                         auto cmd_enc = lock->encrypt_message(cmd);
                         characteristic.write_request(cmd_enc);
 
-                        state = STATE_HANDSHAKE_1;
+                        state = STATE_WAIT_GET_TOKEN;
                     }
                 }
             }
             break;
 
-        case STATE_HANDSHAKE_2:
-            std::cout << "DEBUG: sending followup handshake" << std::endl;
+        case STATE_GET_BATTERY:
+            std::cout << "DEBUG: sending GET_BATTERY request" << std::endl;
             for (auto& service: gatt.primary_services) {
                 for (auto& characteristic: service.characteristics) {
                     if (characteristic.uuid == command) {
-                        // Write the connect command out
+                        // Write out the GET_BATTERY command
                         std::array<std::uint8_t, 16> cmd = { 0x02, 0x01, 0x01, 0x01, entropy[0], entropy[1], entropy[2], entropy[3], 0x06, 0x02,  };
                         for (auto v: cmd) {
                             std::cout << std::setw(2) << std::setfill('0') << std::hex << int(v) << ", ";
@@ -362,7 +362,7 @@ void connect_nokelock(std::string const& token, std::string const& lock_mac)
                         auto cmd_enc = lock->encrypt_message(cmd);
                         characteristic.write_request(cmd_enc);
 
-                        state = STATE_HANDSHAKE_3;
+                        state = STATE_WAIT_GET_BATTERY;
                     }
                 }
             }
@@ -390,8 +390,8 @@ void connect_nokelock(std::string const& token, std::string const& lock_mac)
             }
             break;
 
-        case STATE_HANDSHAKE_1:
-        case STATE_HANDSHAKE_3:
+        case STATE_WAIT_GET_TOKEN:
+        case STATE_WAIT_GET_BATTERY:
         case STATE_WAIT_UNLOCK_FINISH:
         case STATE_WAIT_UNLOCK_NOTIFY:
         case STATE_SEARCHING:
